@@ -14,23 +14,32 @@
     background:var(--bg);color:var(--ink);
     font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
     min-height:100dvh;display:flex;flex-direction:column;justify-content:center;
-    gap:16px;padding:24px;max-width:420px;margin:0 auto;
+    gap:14px;padding:24px;max-width:420px;margin:0 auto;
   }
   .play{
-    width:100%;padding:28px 16px;border-radius:14px;
+    width:100%;padding:26px 16px;border-radius:14px;
     background:var(--panel);border:1px solid var(--line);border-left-width:5px;
     color:var(--ink);font-size:1.15rem;font-weight:700;font-family:inherit;cursor:pointer;
   }
   .play:active{filter:brightness(1.3)}
   #btnStart{border-left-color:var(--start)}
   #btnStop{border-left-color:var(--stop)}
-  .method-label{font-size:.72rem;color:var(--sub);letter-spacing:.08em;margin-top:8px}
+  .label{font-size:.72rem;color:var(--sub);letter-spacing:.08em;margin-top:6px}
   .seg{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .seg button{
     flex:1;padding:12px 4px;background:var(--panel);color:var(--sub);
     border:none;font-size:.82rem;font-weight:600;font-family:inherit;cursor:pointer;
   }
   .seg button.active{background:var(--ink);color:var(--bg)}
+  #warnBox{
+    display:none;background:rgba(240,113,90,.12);border:1px solid var(--stop);
+    border-radius:10px;padding:12px 14px;
+  }
+  #warnBox .msg{color:var(--stop);font-size:.92rem;font-weight:700;line-height:1.5}
+  #warnBox .nums{
+    font-family:ui-monospace,"SF Mono",Menlo,monospace;
+    font-size:.68rem;color:var(--sub);margin-top:6px;
+  }
 </style>
 </head>
 <body>
@@ -38,7 +47,14 @@
 <button class="play" id="btnStart">▶ 録音を始めます</button>
 <button class="play" id="btnStop">■ 録音を停止します</button>
 
-<p class="method-label">再生方法</p>
+<div id="warnBox">
+  <div class="msg">⚠ 音が出ていない可能性があります。<br>音量ボタンで音を出してください。</div>
+  <div class="nums" id="warnNums"></div>
+</div>
+
+<p class="label" id="debugLine" style="display:none"></p>
+
+<p class="label">再生方法</p>
 <div class="seg" role="group" aria-label="再生方法">
   <button id="mAudio" class="active">audio</button>
   <button id="mVideo">video</button>
@@ -57,6 +73,7 @@
   "use strict";
   var method = "audio";
   var ctx = null, bufs = {};
+  var checking = false;
   var els = {
     audio:{ start: document.getElementById("audStart"), stop: document.getElementById("audStop") },
     video:{ start: document.getElementById("vidStart"), stop: document.getElementById("vidStop") }
@@ -73,25 +90,39 @@
     });
   });
 
-  function playWebAudio(phrase){
+  var warnBox = document.getElementById("warnBox");
+  var warnNums = document.getElementById("warnNums");
+  function showWarn(nums){
+    warnNums.textContent = nums || "";
+    warnBox.style.display = "block";
+  }
+  function hideWarn(){ warnBox.style.display = "none"; }
+
+  function ensureCtx(){
     if(!ctx){
       var AC = window.AudioContext || window.webkitAudioContext;
-      if(!AC){ alert("Web Audio非対応のブラウザです"); return; }
+      if(!AC) return null;
       ctx = new AC();
     }
-    var resume = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
+    return ctx;
+  }
+
+  function playWebAudio(phrase){
+    var c = ensureCtx();
+    if(!c){ alert("Web Audio非対応のブラウザです"); return; }
+    var resume = c.state === "suspended" ? c.resume() : Promise.resolve();
     resume.then(function(){
       if(bufs[phrase]) return bufs[phrase];
       var b64 = els.audio[phrase].src.split(",")[1];
       var bin = atob(b64), arr = new Uint8Array(bin.length);
       for(var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
       return new Promise(function(res, rej){
-        ctx.decodeAudioData(arr.buffer, function(d){ bufs[phrase] = d; res(d); }, rej);
+        c.decodeAudioData(arr.buffer, function(d){ bufs[phrase] = d; res(d); }, rej);
       });
     }).then(function(b){
-      var src = ctx.createBufferSource();
+      var src = c.createBufferSource();
       src.buffer = b;
-      src.connect(ctx.destination);
+      src.connect(c.destination);
       src.start(0);
     });
   }
@@ -102,8 +133,106 @@
     try{ el.currentTime = 0; }catch(e){}
     el.play();
   }
-  document.getElementById("btnStart").addEventListener("click", function(){ play("start"); });
-  document.getElementById("btnStop").addEventListener("click", function(){ play("stop"); });
+
+  // 音声帯域(300-3500Hz)の平均エネルギーをdBで測定
+  function bandLevel(analyser, freqData, sampleRate){
+    analyser.getByteFrequencyData(freqData);
+    var binHz = sampleRate / analyser.fftSize;
+    var lo = Math.max(1, Math.floor(300 / binHz));
+    var hi = Math.min(freqData.length - 1, Math.ceil(3500 / binHz));
+    var sum = 0, n = 0;
+    for(var i = lo; i <= hi; i++){ sum += freqData[i]; n++; }
+    var avg = n ? sum / n : 0; // 0-255
+    // byte値をdBに変換（minDecibels〜maxDecibelsに線形マップされている）
+    return analyser.minDecibels + (avg / 255) * (analyser.maxDecibels - analyser.minDecibels);
+  }
+
+  // 一定時間レベルを収集して配列で返す
+  function collectFor(analyser, freqData, sampleRate, ms){
+    return new Promise(function(resolve){
+      var levels = [];
+      var timer = setInterval(function(){
+        levels.push(bandLevel(analyser, freqData, sampleRate));
+      }, 40);
+      setTimeout(function(){
+        clearInterval(timer);
+        resolve(levels);
+      }, ms);
+    });
+  }
+  // パーセンタイル（0-100）
+  function pct(arr, p){
+    if(arr.length === 0) return -Infinity;
+    var s = arr.slice().sort(function(a,b){ return a-b; });
+    var idx = Math.min(s.length - 1, Math.max(0, Math.round((p/100) * (s.length - 1))));
+    return s[idx];
+  }
+
+  // ▶ 録音を始めます: 再生 + ループバックチェック
+  document.getElementById("btnStart").addEventListener("click", function(){
+    hideWarn();
+
+    // チェック中の連打、またはWeb Audio非対応/getUserMedia非対応なら再生のみ
+    var c = ensureCtx();
+    if(checking || !c || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      play("start");
+      return;
+    }
+    checking = true;
+
+    var stream = null;
+    var resume = c.state === "suspended" ? c.resume() : Promise.resolve();
+    resume.then(function(){
+      return navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+    }).then(function(s){
+      stream = s;
+      var src = c.createMediaStreamSource(stream);
+      var analyser = c.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0;
+      analyser.minDecibels = -100;
+      analyser.maxDecibels = -10;
+      src.connect(analyser);
+      var freqData = new Uint8Array(analyser.frequencyBinCount);
+      var sr = c.sampleRate;
+      // マイク安定待ち0.35秒（タップ音の減衰待ち含む）→ 環境音0.7秒 → 再生しながら2.3秒
+      return collectFor(analyser, freqData, sr, 350).then(function(){
+        return collectFor(analyser, freqData, sr, 700);
+      }).then(function(baseLevels){
+        play("start");
+        return collectFor(analyser, freqData, sr, 2300).then(function(durLevels){
+          // 環境音は25パーセンタイル（ノイズ床）: タップ音などの瞬間スパイクを無視
+          // 再生中は80パーセンタイル: 声の合間の無音や単発ノイズに左右されない
+          var noiseFloor = pct(baseLevels, 25);
+          var voiceLevel = pct(durLevels, 80);
+          var MARGIN_DB = 6;
+          var heard = voiceLevel >= noiseFloor + MARGIN_DB;
+          var numsText = "環境音p25 " + noiseFloor.toFixed(1) + "dB / 再生中p80 " + voiceLevel.toFixed(1) +
+                         "dB / 差 " + (voiceLevel - noiseFloor).toFixed(1) + "dB（基準 +" + MARGIN_DB + "dB）";
+          var dbg = document.getElementById("debugLine");
+          dbg.style.display = "block";
+          dbg.textContent = "前回チェック: " + numsText + (heard ? " → 検出" : " → 未検出") +
+                            " ［環境音max " + pct(baseLevels, 100).toFixed(1) + "dB］";
+          if(!heard){
+            showWarn(numsText);
+          }
+        });
+      });
+    }).catch(function(e){
+      // マイク不許可・エラー時はチェックを諦めて再生のみ（警告は出さない）
+      play("start");
+    }).then(function(){
+      if(stream) stream.getTracks().forEach(function(t){ t.stop(); });
+      checking = false;
+    });
+  });
+
+  // ■ 停止はチェックなしで再生のみ
+  document.getElementById("btnStop").addEventListener("click", function(){
+    play("stop");
+  });
 })();
 </script>
 </body>
